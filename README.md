@@ -1,6 +1,7 @@
-hasura metadata benchmark for distributed databases that speak the
-postgres wire protocol.
+benchmark for (distributed) databases that speak the postgres wire protocol.
 
-```sh
-# start pg
+```
+export METADATA_BENCHMARK_CONN_STRING=<pg conn string>
+psql METADATA_BENCHMARK_CONN_STRING -f init.sql
+cabal new-run
 ```
