@@ -13,7 +13,7 @@
 import Control.Concurrent ()
 import Control.Concurrent.Async (forConcurrently)
 import Control.Monad (forM, forM_, replicateM_, void)
-import Control.Monad.IO.Class ( MonadIO(..) )
+import Control.Monad.IO.Class (MonadIO (..))
 import Control.Monad.Reader
   ( MonadReader,
     ReaderT (runReaderT),
@@ -52,48 +52,56 @@ import System.Clock
 import System.Environment (getArgs, getEnv)
 import System.IO (hFlush, stdout)
 import Text.Printf (printf)
-
-data MetadataQuery
-  = MetadataSelect
-  | MetadataUpdate Value UUID
+import Data.List (unfoldr)
 
 updateMetadata ::
   (MonadIO m, MonadReader Env m) => Query -> Query -> String -> Int -> m ()
 updateMetadata select update testName numThreads = do
   connString <- asks envConnString
-  numRuns <- asks envNumRuns
+  numSets <- asks envNumSets
+  numRunsPerThread <- asks envNumRunsPerThread
   let fullTestName =
         testName
           <> " ("
+          <> show numSets
+          <> " sets of "
           <> show numThreads
-          <> " thr × "
-          <> show numRuns
+          <> " threads × "
+          <> show numRunsPerThread
           <> " runs each)"
-  liftIO $ putStrLn $ "\nrunning test:h " <> fullTestName
+  liftIO $ putStrLn $ "\nrunning test: " <> fullTestName
   conn <- measureTime 0 "acquiring conn" $ liftIO $ connectPostgreSQL connString
-  allIds :: [Only UUID] <-
-    measureTime 0 "select ids" (liftIO $ query conn select (Only (numRuns * numThreads)))
+  idChunks :: [[[Only UUID]]] <-
+    fmap (chunks numRunsPerThread) . chunks (numThreads * numRunsPerThread) <$>
+    measureTime
+      0
+      "select ids"
+      ( liftIO $
+          query conn select (Only (numSets * numRunsPerThread * numThreads))
+      )
+  -- liftIO $ print idChunks
 
-  (firsts :: [Double], rests :: [Vector Double]) <-
+  (firsts :: [[Double]], rests :: [[Vector Double]]) <-
     liftIO $
-      unzip <$> forConcurrently [1 .. numThreads] \tid -> do
-        -- putStrLn $ "in thread " ++ show tid
-        conn <- measureTime tid "acquiring conn" $ connectPostgreSQL connString
-        let ids = take numRuns (drop ((tid - 1) * numRuns) allIds) -- lmao
-        times <-
-          Vector.fromList <$> forM ids \(Only i) -> do
-            -- print i
-            meta <- toJSON <$> mkMetadata
-            ((), t) <- measureTime_ tid "update" do
-              runSql (Proxy @(Only Value)) (MetadataUpdate meta i) conn update
-            pure t
-        pure (Vector.head times, Vector.tail times)
+      unzip <$> forM (zip [1..] idChunks) \(setId, setChunks) ->
+        unzip <$> forConcurrently (zip [1..] setChunks) \(threadId, rowIds) -> do
+          -- putStrLn $ "in thread " ++ show tid
+          conn <- measureTime threadId "acquiring conn" $ connectPostgreSQL connString
+          let ids = idChunks !! threadId -- lmao
+          times <-
+            Vector.fromList <$> forM rowIds \(Only i) -> do
+              -- print i
+              meta <- toJSON <$> mkMetadata
+              ((), t) <- measureTime_ threadId "update" do
+                runSql (Proxy @(Only Value)) (MetadataUpdate meta i) conn update
+              pure t
+          pure (Vector.head times, Vector.tail times)
 
   -- putStrLn fullTestName
-  liftIO $ printf "  first runs: "
-  ppStats (Vector.fromList firsts)
-  liftIO $ printf "  later runs: "
-  ppStats (mconcat rests)
+  liftIO $ printf "     first run:  "
+  ppStats (Vector.fromList (concat firsts))
+  liftIO $ printf "  steady state:  "
+  ppStats (mconcat (concat rests))
 
 updateMetadataGlobal =
   updateMetadata
@@ -107,24 +115,29 @@ updateMetadataLocal =
     "UPDATE hdb_metadata_split SET metadata = ? WHERE project_id = ? AND geo_partition = 'IN'"
     "update, one row, partitioned"
 
-getConnString :: IO ByteString
-getConnString = fromString <$> getEnv "METADATA_BENCHMARK_CONN_STRING"
-
-getNumRuns :: IO Int
-getNumRuns = read <$> getEnv "METADATA_BENCHMARK_NUM_RUNS"
-
-data Env = Env {envConnString :: ByteString, envNumRuns :: Int}
+data Env = Env
+  { envConnString :: ByteString,
+    envNumSets :: Int,
+    envNumRunsPerThread :: Int
+  }
   deriving (Show)
 
+initEnv :: IO Env
+initEnv =
+  Env
+    <$> envBS "METADATA_BENCHMARK_CONN_STRING"
+    <*> envRead "METADATA_BENCHMARK_NUM_RUNS_PER_THREAD"
+    <*> envRead "METADATA_BENCHMARK_NUM_SETS"
+  where
+    envBS = fmap fromString . getEnv
+    envRead = fmap read . getEnv
+
 main = do
-  connString <- getConnString
-  numRuns <- getNumRuns
-  putStrLn ("conn string: " ++ show connString)
-  let env = Env connString numRuns
+  env <- initEnv
   flip runReaderT env do
     -- this can be eta-reduced into for xs (for ys) but that looks odd
     forM_ [updateMetadataGlobal, updateMetadataLocal] \bench -> do
-      forM_ [1, 2, 5, 10] \numThreads -> do
+      forM_ [1, 2, 4] \numThreads -> do
         bench numThreads
 
 -- putStrLn "\nrunning test: 2 × 10 select 1"
@@ -190,6 +203,10 @@ instance ToJSON FakeMetadata
 mkMetadata :: IO FakeMetadata
 mkMetadata = FakeMetadata <$> UUID.nextRandom <*> UUID.nextRandom
 
+data MetadataQuery
+  = MetadataSelect
+  | MetadataUpdate Value UUID
+
 runSqlFile ::
   forall r a. FromRow r => Proxy r -> MetadataQuery -> Connection -> FilePath -> IO ()
 runSqlFile p payload conn f = void do
@@ -223,6 +240,8 @@ measureTime_ threadNum msg f = do
 measureTime :: MonadIO m => Int -> [Char] -> m a -> m a
 measureTime t m f = fst <$> measureTime_ t m f
 
+chunks n = takeWhile (not . null) . unfoldr (Just . splitAt n)
+
 -- replicateQuery connString n tid f = do
 --   conn <- measureTime tid "acquiring conn" $ connectPostgreSQL connString
 --   replicateM_ n (f tid conn)
@@ -255,7 +274,7 @@ ppStats xs =
   let Stats {..} = computeStats xs
    in liftIO $
         printf
-          "count %3d, mean %8.1f ms, stddev %8.1f ms, skewness %8.1f ms\n"
+          "n = %3d, mean %8.1f ms, stddev %8.1f ms, skewness %8.1f ms\n"
           statsCount
           statsMean
           statsStdDev
