@@ -11,7 +11,6 @@
 {-# LANGUAGE TypeApplications #-}
 
 import Control.Concurrent ()
-import Data.List.Split ( splitOn )
 import Control.Concurrent.Async (forConcurrently)
 import Control.Monad (forM, forM_, replicateM_, void)
 import Control.Monad.IO.Class (MonadIO (..))
@@ -24,6 +23,8 @@ import Data.Aeson (ToJSON (toJSON), Value)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Kind (Type)
+import Data.List (unfoldr)
+import Data.List.Split (splitOn)
 import Data.Proxy (Proxy (..))
 import Data.String (IsString (..))
 import Data.UUID (UUID)
@@ -53,7 +54,6 @@ import System.Clock
 import System.Environment (getArgs, getEnv)
 import System.IO (hFlush, stdout)
 import Text.Printf (printf)
-import Data.List (unfoldr)
 
 updateMetadata ::
   (MonadIO m, MonadReader Env m) => Query -> Query -> String -> Int -> m ()
@@ -61,31 +61,30 @@ updateMetadata select update testName numThreads = do
   connString <- asks envConnString
   numSets <- asks envNumSets
   numRunsPerThread <- asks envNumRunsPerThread
-  let fullTestName =
-        testName
-          <> " ("
-          <> show numSets
-          <> " sets of "
-          <> show numThreads
-          <> " threads × "
-          <> show numRunsPerThread
-          <> " runs each)"
-  liftIO $ putStrLn $ "\nrunning test: " <> fullTestName
+  liftIO $
+    printf
+      "%s (%d sets of %d threads × %d runs each)"
+      testName
+      numSets
+      numThreads
+      numRunsPerThread
   conn <- measureTime 0 "acquiring conn" $ liftIO $ connectPostgreSQL connString
   idChunks :: [[[Only UUID]]] <-
-    fmap (chunks numRunsPerThread) . chunks (numThreads * numRunsPerThread) <$>
-    measureTime
-      0
-      "select ids"
-      ( liftIO $
-          query conn select (Only (numSets * numRunsPerThread * numThreads))
-      )
+    fmap (chunks numRunsPerThread) . chunks (numThreads * numRunsPerThread)
+      <$> measureTime
+        0
+        "select ids"
+        ( liftIO $
+            query conn select (Only (numSets * numRunsPerThread * numThreads))
+        )
   -- liftIO $ print idChunks
 
-  (firsts :: [[Double]], rests :: [[Vector Double]]) <-
+  let chunkIter k chunks f = unzip <$> k (zip [1 ..] chunks) f
+
+  (firsts, rests) <-
     liftIO $
-      unzip <$> forM (zip [1..] idChunks) \(setId, setChunks) ->
-        unzip <$> forConcurrently (zip [1..] setChunks) \(threadId, rowIds) -> do
+      chunkIter forM idChunks \(setId, setChunks) ->
+        chunkIter forConcurrently setChunks \(threadId, rowIds) -> do
           -- putStrLn $ "in thread " ++ show tid
           conn <- measureTime threadId "acquiring conn" $ connectPostgreSQL connString
           let ids = idChunks !! threadId -- lmao
@@ -98,7 +97,6 @@ updateMetadata select update testName numThreads = do
               pure t
           pure (Vector.head times, Vector.tail times)
 
-  -- putStrLn fullTestName
   liftIO $ printf "     first run:  "
   ppStats (Vector.fromList (concat firsts))
   liftIO $ printf "  steady state:  "
@@ -278,8 +276,7 @@ ppStats xs =
   let Stats {..} = computeStats xs
    in liftIO $
         printf
-          "n = %3d, mean %8.1f ms, stddev %8.1f ms, skewness %8.1f ms\n"
+          "n = %3d, mean %8.1f ms, stddev %8.1f ms"
           statsCount
           statsMean
           statsStdDev
-          statsSkewness
