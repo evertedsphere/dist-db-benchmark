@@ -1,5 +1,6 @@
 {-# LANGUAGE BlockArguments #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
@@ -8,16 +9,21 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE FlexibleContexts #-}
 
 import Control.Concurrent ()
 import Control.Concurrent.Async (forConcurrently)
 import Control.Monad (forM, forM_, replicateM_, void)
+import Control.Monad.IO.Class ( MonadIO(..) )
 import Control.Monad.Reader
+  ( MonadReader,
+    ReaderT (runReaderT),
+    asks,
+  )
 import Data.Aeson (ToJSON (toJSON), Value)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as BS
 import Data.Kind (Type)
+import Data.Proxy (Proxy (..))
 import Data.String (IsString (..))
 import Data.UUID (UUID)
 import Data.UUID.V4 as UUID (nextRandom)
@@ -35,8 +41,6 @@ import Database.PostgreSQL.Simple
     query,
     query_,
   )
-import Formatting ()
-import Formatting.Clock ()
 import GHC.Generics (Generic)
 import Statistics.Sample qualified as Statistics
 import System.Clock
@@ -48,13 +52,12 @@ import System.Clock
 import System.Environment (getArgs, getEnv)
 import System.IO (hFlush, stdout)
 import Text.Printf (printf)
-import Data.Proxy ( Proxy(..) )
 
 data MetadataQuery
   = MetadataSelect
   | MetadataUpdate Value UUID
 
-updateMetadata :: 
+updateMetadata ::
   (MonadIO m, MonadReader Env m) => Query -> Query -> String -> Int -> m ()
 updateMetadata select update testName numThreads = do
   connString <- asks envConnString
@@ -66,24 +69,25 @@ updateMetadata select update testName numThreads = do
           <> " thr × "
           <> show numRuns
           <> " runs each)"
-  liftIO $ putStrLn $ "\nrunning test: " <> fullTestName
+  liftIO $ putStrLn $ "\nrunning test:h " <> fullTestName
   conn <- measureTime 0 "acquiring conn" $ liftIO $ connectPostgreSQL connString
   allIds :: [Only UUID] <-
     measureTime 0 "select ids" (liftIO $ query conn select (Only (numRuns * numThreads)))
 
   (firsts :: [Double], rests :: [Vector Double]) <-
-    liftIO $ unzip <$> forConcurrently [1 .. numThreads] \tid -> do
-      -- putStrLn $ "in thread " ++ show tid
-      conn <- measureTime tid "acquiring conn" $ connectPostgreSQL connString
-      let ids = take numRuns (drop ((tid - 1) * numRuns) allIds) -- lmao
-      times <-
-        Vector.fromList <$> forM ids \(Only i) -> do
-          -- print i
-          meta <- toJSON <$> mkMetadata
-          ((), t) <- measureTime_ tid "update" do
-            runSql (Proxy @(Only Value)) (MetadataUpdate meta i) conn update
-          pure t
-      pure (Vector.head times, Vector.tail times)
+    liftIO $
+      unzip <$> forConcurrently [1 .. numThreads] \tid -> do
+        -- putStrLn $ "in thread " ++ show tid
+        conn <- measureTime tid "acquiring conn" $ connectPostgreSQL connString
+        let ids = take numRuns (drop ((tid - 1) * numRuns) allIds) -- lmao
+        times <-
+          Vector.fromList <$> forM ids \(Only i) -> do
+            -- print i
+            meta <- toJSON <$> mkMetadata
+            ((), t) <- measureTime_ tid "update" do
+              runSql (Proxy @(Only Value)) (MetadataUpdate meta i) conn update
+            pure t
+        pure (Vector.head times, Vector.tail times)
 
   -- putStrLn fullTestName
   liftIO $ printf "  first runs: "
@@ -95,24 +99,28 @@ updateMetadataGlobal =
   updateMetadata
     "SELECT project_id FROM hdb_metadata LIMIT ?"
     "UPDATE hdb_metadata SET metadata = ? WHERE project_id = ?"
-    "update metadata, non-partitioned"
+    "update, one row, non-partitioned"
 
 updateMetadataLocal =
   updateMetadata
     "SELECT project_id FROM hdb_metadata_split WHERE geo_partition = 'IN' LIMIT ?"
     "UPDATE hdb_metadata_split SET metadata = ? WHERE project_id = ? AND geo_partition = 'IN'"
-    "update metadata, partitioned"
+    "update, one row, partitioned"
 
 getConnString :: IO ByteString
 getConnString = fromString <$> getEnv "METADATA_BENCHMARK_CONN_STRING"
+
+getNumRuns :: IO Int
+getNumRuns = read <$> getEnv "METADATA_BENCHMARK_NUM_RUNS"
 
 data Env = Env {envConnString :: ByteString, envNumRuns :: Int}
   deriving (Show)
 
 main = do
   connString <- getConnString
+  numRuns <- getNumRuns
   putStrLn ("conn string: " ++ show connString)
-  let env = Env connString 10
+  let env = Env connString numRuns
   flip runReaderT env do
     -- this can be eta-reduced into for xs (for ys) but that looks odd
     forM_ [updateMetadataGlobal, updateMetadataLocal] \bench -> do
@@ -169,8 +177,8 @@ main = do
 -- utils
 --------------------------------------------------------------------------------
 
-truncate' :: Double -> Int -> Double
-truncate' x n = fromIntegral (floor (x * t)) / t
+trunc :: Double -> Int -> Double
+trunc x n = fromIntegral (floor (x * t)) / t
   where
     t = 10 ^ n
 
@@ -207,7 +215,7 @@ measureTime_ threadNum msg f = do
   -- putStrLn
   --   ( threadPrefix threadNum ++ msg
   --       ++ " -> "
-  --       ++ show (truncate' delta 1)
+  --       ++ show (trunc delta 1)
   --       ++ " ms"
   --   )
   pure (r, delta)
@@ -236,7 +244,7 @@ computeStats xs = Stats count mean std skew
     count = Vector.length xs
     [mean, std, skew] =
       map
-        (\f -> truncate' (f xs) 1)
+        (\f -> trunc (f xs) 1)
         [ Statistics.mean,
           Statistics.stdDev,
           Statistics.skewness
@@ -245,10 +253,10 @@ computeStats xs = Stats count mean std skew
 ppStats :: MonadIO m => Vector Double -> m ()
 ppStats xs =
   let Stats {..} = computeStats xs
-   in liftIO $ printf
-        "count %3d, mean %8.1f ms, stddev %8.1f ms, skewness %8.1f ms\n"
-        statsCount
-        statsMean
-        statsStdDev
-        statsSkewness
-
+   in liftIO $
+        printf
+          "count %3d, mean %8.1f ms, stddev %8.1f ms, skewness %8.1f ms\n"
+          statsCount
+          statsMean
+          statsStdDev
+          statsSkewness
