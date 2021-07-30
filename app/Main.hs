@@ -11,6 +11,7 @@
 {-# LANGUAGE TypeApplications #-}
 
 import Control.Concurrent ()
+import Data.List.Split ( splitOn )
 import Control.Concurrent.Async (forConcurrently)
 import Control.Monad (forM, forM_, replicateM_, void)
 import Control.Monad.IO.Class (MonadIO (..))
@@ -118,6 +119,7 @@ updateMetadataLocal =
 data Env = Env
   { envConnString :: ByteString,
     envNumSets :: Int,
+    envNumThreadsPerSet :: [Int],
     envNumRunsPerThread :: Int
   }
   deriving (Show)
@@ -126,11 +128,13 @@ initEnv :: IO Env
 initEnv =
   Env
     <$> envBS "METADATA_BENCHMARK_CONN_STRING"
-    <*> envRead "METADATA_BENCHMARK_NUM_RUNS_PER_THREAD"
-    <*> envRead "METADATA_BENCHMARK_NUM_SETS"
+    <*> envInt "METADATA_BENCHMARK_NUM_SETS"
+    <*> envInts "METADATA_BENCHMARK_NUM_THREADS_PER_SET"
+    <*> envInt "METADATA_BENCHMARK_NUM_RUNS_PER_THREAD"
   where
     envBS = fmap fromString . getEnv
-    envRead = fmap read . getEnv
+    envInt = fmap read . getEnv
+    envInts = fmap (map read . splitOn ",") . getEnv
 
 main = do
   env <- initEnv
